@@ -18,6 +18,8 @@ import csv
 import numpy as np
 import matplotlib.pyplot as plt
 
+from frame_transform import batch_wrench_to_world
+
 
 def load_data(data_input):
     """
@@ -92,8 +94,22 @@ def plot_results(data_input, save_path="flap_test_plot.png", show=True):
     Fx, Fy, Fz = data[:, 7], data[:, 8], data[:, 9]
     Tx, Ty, Tz = data[:, 10], data[:, 11], data[:, 12]
 
+    # --- Rotate the sensor-frame wrench into the fixed tank/world frame ---
+    # Fx/Fy/Fz above are still in the load cell's own frame, which tips
+    # over with the arm every time roll/pitch/yaw changes. Using the
+    # logged pose at each sample, rotate back into a frame that's fixed
+    # in the tank -- see frame_transform.py for the convention/derivation
+    # and the assumption about how the base frame lines up with the tank.
+    poses = data[:, 1:7]
+    wrenches = data[:, 7:13]
+    world_wrench = batch_wrench_to_world(poses, wrenches)
+    Fx_w, Fy_w, Fz_w = world_wrench[:, 0], world_wrench[:, 1], world_wrench[:, 2]
+    Tx_w, Ty_w, Tz_w = world_wrench[:, 3], world_wrench[:, 4], world_wrench[:, 5]
+
     # Set up subplots layout
-    fig, (ax_pos, ax_force, ax_torque) = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+    fig, (ax_pos, ax_force, ax_torque, ax_world) = plt.subplots(
+        4, 1, figsize=(11, 12), sharex=True
+    )
 
     # --- Plot 1: Motion / Kinematics ---
     ax_pos.set_title("Heave + Pitch Flap Test Analysis", fontsize=14, fontweight="bold", pad=12)
@@ -128,11 +144,25 @@ def plot_results(data_input, save_path="flap_test_plot.png", show=True):
     ax_torque.plot(t, Tx, label="Tx", color="#8c564b", linewidth=1.5)
     ax_torque.plot(t, Ty, label="Ty", color="#e377c2", linewidth=1.5)
     ax_torque.plot(t, Tz, label="Tz", color="#17becf", linewidth=1.5)
-    ax_torque.set_xlabel("Time [s]", fontweight="bold")
     ax_torque.set_ylabel("Torque [N·m]", fontweight="bold")
     ax_torque.set_title("Torque Components", fontsize=11, fontweight="bold", loc="left")
     ax_torque.grid(True, linestyle="--", alpha=0.6)
     ax_torque.legend(loc="upper right", framealpha=0.9, ncol=3)
+
+    # --- Plot 4: Tank-frame (world) forces -- lift / thrust / lateral ---
+    # Same data as Plot 2, just rotated into a frame that doesn't rotate
+    # with the arm. If a force is genuinely steady in the tank, it should
+    # now show up as roughly flat here even though it oscillated in
+    # Plot 2's sensor frame.
+    ax_world.plot(t, Fx_w, label="Thrust (world Fx)", color="#2ca02c", linewidth=1.5)
+    ax_world.plot(t, Fy_w, label="Lateral (world Fy)", color="#d62728", linewidth=1.5)
+    ax_world.plot(t, Fz_w, label="Lift (world Fz)", color="#9467bd", linewidth=1.5)
+    ax_world.set_xlabel("Time [s]", fontweight="bold")
+    ax_world.set_ylabel("Force [N]", fontweight="bold")
+    ax_world.set_title("Tank-Frame Forces (rotated out of sensor frame)",
+                        fontsize=11, fontweight="bold", loc="left")
+    ax_world.grid(True, linestyle="--", alpha=0.6)
+    ax_world.legend(loc="upper right", framealpha=0.9, ncol=3)
 
     plt.tight_layout()
 
