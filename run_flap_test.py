@@ -1,118 +1,154 @@
 """
-run_flap_test.py
+run_flap_test.py  (servo-mode version)
 
-Main script for running a heave+pitch flap test on the xArm while
-logging force/torque data from the ATI Mini40 sensor.
+Oscillatory motion test on the xArm with F/T logging.
 
-Data collection is now EVENT-DRIVEN rather than tied to a fixed pose
-count: a separate logging thread watches the arm's actual motion state
-(via get_cmdnum() -- how many queued commands are left to execute) and
-only records while the arm is really moving, starting when motion
-begins and stopping once the queue is confirmed drained. This means the
-number of samples collected depends on how long the arm actually took
-to move, not on how many poses we happened to pre-generate.
+  * Motion is streamed in servo mode (mode 1) with absolute-deadline timing.
+  * The wrench logger runs at LOG_RATE_HZ. Each sample is stamped with the
+    most recently COMMANDED pose (updated at RATE_HZ), which is smooth and
+    is what plotter.py / frame_transform.py use to rotate forces into the
+    tank frame. Log format is unchanged: <run>_log.csv, 13 columns.
+  * Optionally (MEASURE_RATE_HZ > 0) a second thread polls the arm's
+    ACTUAL pose with get_position() and saves it to <run>_meas.csv, so
+    you can compare commanded vs. measured motion. Set it to 0 to disable.
 
-What this script does, in order:
-  1. Connects to the arm and the F/T sensor.
-  2. Moves the arm to a fixed starting pose (BASE_POSE).
-  3. Zeros the F/T sensor while the arm is sitting still there.
-  4. Generates a list of flap poses (the sine-wave motion).
-  5. Starts a background logging thread that waits for real motion to
-     begin, then records (time, wrench) continuously until the arm's
-     queue is confirmed empty.
-  6. Sends the poses to the arm.
-  7. Waits for the arm to actually finish (forces the queue to drain).
-  8. Saves the logged data to a CSV.
-  9. Cleans up both devices whether the run finished normally, was
-     stopped with Ctrl+C, or hit an error.
-
-Run it with:
-    python run_flap_test.py
-Stop it at any time with Ctrl+C.
+Run:  python run_flap_test.py      Stop any time with Ctrl+C.
 """
 
+import os
 import time
 import csv
 import threading
-import math
+import traceback
 from arm import Arm
-from trajectory import generate_flap_trajectory
+from trajectory import generate_oscillatory_trajectory
 from ft_sensor import FTSensor
 from plotter import plot_results
 
-# ----------------------------------------------------------------------
-# Arm setup
-# ----------------------------------------------------------------------
+
+# ======================================================================
+# CONFIG
+# ======================================================================
+
+# --- Arm setup ---
 ARM_IP = "192.168.1.235"
+TCP_OFFSET = [0, 0, 200, 0, 0, -151.8]
+BASE_POSE = [525.0, 0.0, -100.0, 180.0, 0.0, 0]
 
-# TCP offset moves the arm's "tool point" from the bare flange out to
-# wherever the sensor/airfoil actually sits. Set once, matches physical
-# mounting -- see arm.py's set_tcp_offset() for details.
-TCP_OFFSET = [0, 0, 200, 0, 0, 0]
+# --- Sensor setup ---
+CAL_FILE = "FT75200/FT75200.cal"
+DAQ_CHANNELS = "Dev1/ai0:5"
 
-# Neutral pose the flap motion oscillates around: [x, y, z, roll, pitch, yaw].
-# Jog the arm to your desired starting position/orientation and read this
-# back with arm.get_position() if you need to find your own values.
-BASE_POSE = [400.0, 0.0, -300.0, 180.0, 0.0, 0.0]
+# --- Motion / timing ---
+SPEED = 1000        # mm/s, point-to-point moves only
+MVACC = 3000        # mm/s^2, same
+HOME_SPEED = 100    # mm/s, gentle return to BASE_POSE after the run
+RATE_HZ = 200       # servo command rate
+LOG_RATE_HZ = 500   # wrench logging rate
+MEASURE_RATE_HZ = 50  # measured-pose polling rate (0 = off). Each poll is a
+                      # network round trip; if sends start missing deadlines,
+                      # lower this or set it to 0.
 
-# ----------------------------------------------------------------------
-# Sensor setup
-# ----------------------------------------------------------------------
-CAL_FILE = "FT75200/FT75200.cal"   # path to your sensor's calibration file
-DAQ_CHANNELS = "Dev1/ai0:5"         # NI channel string for the 6 gauge inputs
+# --- Motion definition ---
+N_CYCLES = 30
+REF_FREQ_HZ = 1
 
-# ----------------------------------------------------------------------
-# Motion / timing parameters
-# ----------------------------------------------------------------------
-SPEED = 500      # mm/s, arm default move speed
-MVACC = 2000     # mm/s^2, arm default move acceleration
-RATE_HZ = 100    # how many poses/sec we command to the arm. This is NOT
-                 # the logging rate anymore (see LOG_RATE_HZ below), and
-                 # NOT the DAQ's own internal sample_rate_hz (set in
-                 # FTSensor) -- three separate rates, three separate jobs.
-LOG_RATE_HZ = 500   # how often the logging thread records a sample while
-                     # the arm is confirmed moving
+# {dof_name: (amplitude, freq_hz, phase_deg)}  (mm for x/y/z, deg otherwise)
+DOFS = {
+    "x":     (100, REF_FREQ_HZ, 0),
+    "pitch": (20,  REF_FREQ_HZ, 180),
+}
 
+# --- Pure yaw example ---
+# N_CYCLES = 8
+# REF_FREQ_HZ = 1.0
+# DOFS = {"yaw": (20, 1.0, 0)}
 
-def log_while_moving(arm, sensor, t0, log_rows, log_lock, done_sending,
-                      log_rate_hz=LOG_RATE_HZ, poll_interval_s=0.02):
-    """
-    Runs in its own thread. Waits for the arm to actually start moving
-    (get_cmdnum() > 0), then records (timestamp, wrench) continuously at
-    log_rate_hz until the arm's command queue is confirmed drained
-    (get_cmdnum() == 0) -- i.e. logging is bounded by REAL physical
-    motion, not by how many poses we happened to generate ahead of time.
-    """
-    dt = 1.0 / log_rate_hz
+# Warn if the first waypoint is farther than this from the arm's current
+# pose (servo mode faults on big jumps).
+START_JUMP_WARN_MM = 2.0
+START_JUMP_WARN_DEG = 1.0
 
-    # Wait for motion to actually begin. Without this, we might check
-    # get_cmdnum() before the very first command has been sent/
-    # registered, see 0, and quit immediately having logged nothing.
-    while arm.get_cmdnum() == 0 and not done_sending.is_set():
-        time.sleep(poll_interval_s)
+# --- Output ---
+# Every run writes its files into OUTPUT_DIR (created if missing), named
+# from the motion settings plus the run's start time, so nothing is ever
+# overwritten. Example:
+#   data/x100_pitch30_0.5Hz_20261011_201153_log.csv
+OUTPUT_DIR = "data"
 
-    print("[log] Motion detected -- starting to log")
-
-    while arm.is_moving() or not done_sending.is_set():
-        loop_start = time.perf_counter() # Record the start time of this loop iteration
-
-        pos = arm.get_position()
-        wrench = sensor.read_wrench()
-        t = time.perf_counter() - t0
-        with log_lock:
-            log_rows.append([t, *pos, *wrench])
-
-        elapsed = time.perf_counter() - loop_start
-        if elapsed < dt:
-            time.sleep(dt - elapsed)  # Sleep only for the remaining time to maintain the desired logging rate
-
-    print("[log] Motion stopped -- ending log")
-
-
-def save_log(rows, path="flap_test_log.csv"):
-    """Writes collected rows to a CSV: time, position, then wrench."""
-    header = ["t", "x", "y", "z", "roll", "pitch", "yaw",
+LOG_HEADER = ["t", "x", "y", "z", "roll", "pitch", "yaw",
               "Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
+MEAS_HEADER = ["t", "x", "y", "z", "roll", "pitch", "yaw"]
+
+# ======================================================================
+# End of CONFIG
+# ======================================================================
+
+
+def wait_until(deadline):
+    """
+    Wait until perf_counter() >= deadline without hogging the GIL: short
+    sleeps, then yield for the final millisecond so other threads run.
+    """
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        time.sleep(0.0005 if remaining > 0.001 else 0)
+
+
+def guarded(name, fn, *args):
+    """Thread wrapper: print a traceback instead of dying silently."""
+    try:
+        fn(*args)
+    except Exception:
+        print(f"[{name}] CRASHED:")
+        traceback.print_exc()
+
+
+def log_wrench(sensor, state, t0, rows, start, stop, rate_hz):
+    """Records (t, latest commanded pose, wrench) at rate_hz until stop."""
+    start.wait()
+    print("[log] Wrench logging started")
+    dt = 1.0 / rate_hz
+    next_t = time.perf_counter()
+
+    while not stop.is_set():
+        pose = state["cmd_pose"]          # replaced atomically by the sender
+        wrench = sensor.read_wrench()
+        rows.append([time.perf_counter() - t0, *pose, *wrench])
+        next_t += dt
+        wait_until(next_t)
+
+    print("[log] Wrench logging stopped")
+
+
+def poll_measured_pose(arm, t0, rows, start, stop, rate_hz):
+    """Records (t, actual pose from the controller) at rate_hz until stop."""
+    start.wait()
+    print("[meas] Pose polling started")
+    dt = 1.0 / rate_hz
+    next_t = time.perf_counter()
+
+    while not stop.is_set():
+        pos = arm.get_position()
+        if pos is not None:
+            rows.append([time.perf_counter() - t0, *pos])
+        next_t += dt
+        wait_until(next_t)
+
+    print("[meas] Pose polling stopped")
+
+
+def make_run_prefix():
+    """Unique file prefix: motion settings + start time, inside OUTPUT_DIR."""
+    dof_tag = "_".join(f"{name}{amp:g}" for name, (amp, _f, _p) in DOFS.items())
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(OUTPUT_DIR, f"{dof_tag}_{REF_FREQ_HZ:g}Hz_{stamp}")
+
+
+def save_rows(rows, header, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
@@ -120,160 +156,171 @@ def save_log(rows, path="flap_test_log.csv"):
     print(f"[run] Saved {len(rows)} rows to {path}")
 
 
+def save_with_fallback(rows, header, path):
+    try:
+        save_rows(rows, header, path)
+    except PermissionError:
+        fallback = path.replace(".csv", f"_{int(time.time())}.csv")
+        print(f"[run] {path} is locked -- saving to {fallback} instead.")
+        save_rows(rows, header, fallback)
+
+
+def check_start_pose(arm, first_pose):
+    """Print how far the arm is from the first waypoint (servo jump check)."""
+    cur = arm.get_position()
+    if cur is None:
+        print("[run] WARNING: could not read current pose for start check.")
+        return
+    dpos = max(abs(cur[i] - first_pose[i]) for i in range(3))
+    dang = max(abs(cur[i] - first_pose[i]) for i in range(3, 6))
+    print(f"[run] Start check: max pos offset {dpos:.2f} mm, "
+          f"max angle offset {dang:.2f} deg")
+    if dpos > START_JUMP_WARN_MM or dang > START_JUMP_WARN_DEG:
+        print("[run] WARNING: first waypoint differs from current pose -- "
+              "servo mode may fault on the initial jump.")
+
+
 def main():
+    run_prefix = make_run_prefix()
     arm = Arm(ARM_IP)
     sensor = FTSensor(cal_file_path=CAL_FILE, channels=DAQ_CHANNELS)
 
-    # Declared here (not inside the try block) so it's still accessible
-    # afterward even if something goes wrong mid-run -- we don't want to
-    # lose already-collected data just because of an error later on.
+    # Created before the try block so cleanup can always reference them.
     log_rows = []
-
+    meas_rows = []
+    state = {"cmd_pose": list(BASE_POSE)}   # latest commanded pose
+    start_logging = threading.Event()
+    stop_logging = threading.Event()
+    threads = []
+    servo_active = False
 
     try:
-        # --- Arm setup ---
+        # --- Arm setup (mode 0, point-to-point) ---
         arm.connect()
         arm.set_tcp_offset(TCP_OFFSET)
-        # wait=True here: we want the arm to actually finish arriving at
-        # BASE_POSE before we zero the sensor and start the fast loop.
         arm.move_to(*BASE_POSE, speed=SPEED, mvacc=MVACC, wait=True)
+        if arm.is_aborted():
+            print("[run] Arm is in an error state after setup -- not starting. "
+                  "Check the error code printed above.")
+            return
 
         # --- Sensor setup ---
         sensor.connect()
-        sensor.zero()   # arm is at rest at BASE_POSE here -- good, repeatable
-                         # moment to zero out any resting offset/tare
-        sensor.start_streaming()   # starts the background DAQ read thread
+        sensor.zero()
+        sensor.start_streaming()
 
-        # --- Build the trajectory ---
-        # All the sine-wave math lives in trajectory.py -- this just asks
-        # for a list of poses given the parameters below.
-        poses = generate_flap_trajectory(
+        # --- Trajectory ---
+        poses = generate_oscillatory_trajectory(
             base_pose=BASE_POSE,
-            n_cycles=5,
-            heave_amp_mm=100,
-            pitch_amp_deg=30,
-            freq_hz=1.5,
-            phase_offset_deg=180,
+            n_cycles=N_CYCLES,
+            ref_freq_hz=REF_FREQ_HZ,
             rate_hz=RATE_HZ,
+            dofs=DOFS,
         )
+        dt = 1.0 / RATE_HZ
+        print(f"[run] {len(poses)} poses at {RATE_HZ} Hz "
+              f"(~{len(poses) * dt:.1f} s). Press Ctrl+C to stop.")
 
-        print(f"[run] Sending {len(poses)} poses. Press Ctrl+C to stop.")
+        check_start_pose(arm, poses[0])
+
+        # --- Logger threads (wait for start_logging) ---
         run_start = time.perf_counter()
 
-        # Start the logger in its own thread -- it will wait for motion
-        # to begin, log continuously while the arm is confirmed moving,
-        # and stop once the queue is confirmed drained. This runs
-        # concurrently with the pose-sending loop below.
-        log_lock = threading.Lock()
-        done_sending = threading.Event()
+        threads.append(threading.Thread(
+            target=guarded,
+            args=("log", log_wrench, sensor, state, run_start, log_rows,
+                  start_logging, stop_logging, LOG_RATE_HZ),
+            daemon=True))
+        if MEASURE_RATE_HZ > 0:
+            threads.append(threading.Thread(
+                target=guarded,
+                args=("meas", poll_measured_pose, arm, run_start, meas_rows,
+                      start_logging, stop_logging, MEASURE_RATE_HZ),
+                daemon=True))
+        for th in threads:
+            th.start()
 
-        logger_thread = threading.Thread(
-            target=log_while_moving,
-            args=(arm, sensor, run_start, log_rows, log_lock, done_sending),
-            daemon=True,
-        )
-        logger_thread.start()
+        # --- Stream the motion in servo mode ---
+        arm.enter_servo_mode()
+        servo_active = True
 
-        # Send the poses. No sensor reading happens here anymore -- the
-        # logger thread above handles that independently now.
-        dt = 1.0 / RATE_HZ
-        prev_pose = BASE_POSE # Keep track of the previous pose
+        start_logging.set()
+        t_start = time.perf_counter()
+        late_count = 0
 
-        for pose in poses:
+        for i, pose in enumerate(poses):
             if arm.is_aborted():
-                print("[run] Arm aborted (error state) -- stopping")
+                print(f"[run] Arm aborted at pose {i}/{len(poses)} -- stopping")
                 break
 
-            # Calculate distance of next step
-            dx = pose[0] - prev_pose[0]
-            dy = pose[1] - prev_pose[1]
-            dz = pose[2] - prev_pose[2]
-            distance = math.sqrt(dx**2 + dy**2 + dz**2)
+            ret = arm.servo_to(pose)
+            state["cmd_pose"] = pose
+            if ret != 0:
+                print(f"[run] servo_to returned {ret} at pose {i}")
 
-            # Calculate required speed to reach the next pose in the desired time
-            dynamic_speed = max(0.1, distance / dt)  # Avoid zero speed
+            deadline = t_start + (i + 1) * dt
+            if time.perf_counter() > deadline:
+                late_count += 1
+            wait_until(deadline)
 
-            t1 = time.perf_counter()
+        stop_logging.set()
+        for th in threads:
+            th.join(timeout=5.0)
 
-            arm.move_to(*pose, speed=dynamic_speed, mvacc=MVACC, radius=0, wait=False)
-            elapsed = time.perf_counter() - t1
-            if elapsed < dt:
-                time.sleep(dt - elapsed)
+        if late_count:
+            print(f"[run] NOTE: {late_count} of {len(poses)} sends missed "
+                  f"their deadline. If this is more than ~1-2%, lower "
+                  f"MEASURE_RATE_HZ / LOG_RATE_HZ / RATE_HZ.")
 
-            prev_pose = pose  # Update previous pose for the next iteration
+        # --- Leave servo mode; return home unless the arm faulted ---
+        arm.exit_servo_mode()
+        servo_active = False
+        if not arm.is_aborted():
+            print("[run] Returning to BASE_POSE...")
+            arm.move_to(*BASE_POSE, speed=HOME_SPEED, mvacc=MVACC, wait=True)
+        else:
+            print("[run] Arm is in an error state -- NOT returning home. "
+                  "Check the error code, then reset_abort() when safe.")
 
-        done_sending.set()  # signal the logger thread that we're done sending poses
-
-        # Force-drain the queue and confirm the arm is really done. This
-        # also gives the logger thread's is_moving() check a clean,
-        # definite point at which to stop, and returns the arm to a
-        # known, safe resting pose.
-        print("[run] Waiting for arm to finish physically executing queued moves...")
-        arm.move_to(*BASE_POSE, speed=SPEED, mvacc=MVACC, wait=True)
-        print("[run] Arm confirmed finished.")
-
-        logger_thread.join(timeout=5.0)   # let the logger thread notice and exit
-        run_end = time.perf_counter()
-        print(f"[run] Done. Wall-clock duration: {run_end - run_start:.2f}s, "
-              f"{len(log_rows)} samples logged")
-
-        save_log(log_rows)
+        print(f"[run] Done. Wall-clock {time.perf_counter() - run_start:.2f}s, "
+              f"{len(log_rows)} wrench samples, {len(meas_rows)} pose samples")
 
     except KeyboardInterrupt:
-        # Ctrl+C lands here. IMPORTANT: this only stops the Python loop
-        # from sending new commands -- it does NOT stop the arm itself.
-        # move_to(wait=False) queues commands on the controller, which can
-        # keep executing already-queued moves even after we stop sending
-        # more. We have to explicitly halt it.
         print("\n[run] Ctrl+C received -- stopping arm.")
         arm.emergency_stop()
 
     except Exception as e:
-        # Anything else going wrong (network hiccup, sensor read error,
-        # unexpected bug, etc.) lands here. Without this, an uncaught
-        # exception would print a traceback and exit WITHOUT stopping the
-        # arm -- and since move_to(wait=False) queues commands on the
-        # controller, the arm keeps executing its queued moves even after
-        # Python has crashed and disconnected. Always stop the arm first.
         print(f"\n[run] Unexpected error: {e!r} -- stopping arm.")
         arm.emergency_stop()
-        raise  # re-raise so you still see the full traceback for debugging
+        raise
 
     finally:
-        # Always runs -- normal finish, Ctrl+C, or an unhandled exception
-        # -- so cleanup happens no matter what.
         print("[run] Cleaning up.")
+        stop_logging.set()
+        for th in threads:
+            th.join(timeout=2.0)
+        if servo_active:
+            try:
+                arm.exit_servo_mode()
+            except Exception as e:
+                print(f"[run] Could not exit servo mode: {e!r}")
         sensor.stop_streaming()
         sensor.disconnect()
         arm.disconnect()
 
- 
-    # --- Save the data (outside the arm-safety try block on purpose) ---
-    # If this fails (e.g. PermissionError because the file is open
-    # elsewhere), we don't want that to look like an arm/motion failure,
-    # and we don't want to lose the data we already collected. Try the
-    # normal filename first, then fall back to a timestamped one so a
-    # locked file doesn't cost you the whole run's data.
+    # --- Save data (outside the safety try block on purpose) ---
     if log_rows:
+        save_with_fallback(log_rows, LOG_HEADER, f"{run_prefix}_log.csv")
+        if meas_rows:
+            save_with_fallback(meas_rows, MEAS_HEADER, f"{run_prefix}_meas.csv")
         try:
-            save_log(log_rows)
-        except PermissionError:
-            fallback_path = f"flap_test_log_{int(time.time())}.csv"
-            print(f"[run] flap_test_log.csv is locked/unwritable "
-                  f"(probably open in another program) -- "
-                  f"saving to {fallback_path} instead.")
-            save_log(log_rows, path=fallback_path)
- 
-        try:
-            plot_results(log_rows)
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            plot_results(log_rows, save_path=f"{run_prefix}_plot.png")
         except Exception as e:
-            # A plotting problem (e.g. no display available, matplotlib
-            # not installed) shouldn't be treated as a failed run -- the
-            # data is already safely saved to CSV above regardless.
             print(f"[run] Could not display plot: {e!r}")
     else:
         print("[run] No data was logged -- nothing to save.")
- 
- 
+
+
 if __name__ == "__main__":
     main()
