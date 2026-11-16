@@ -37,7 +37,7 @@ def load_data(data_input):
     if isinstance(data_input, str):
         if not os.path.exists(data_input):
             raise FileNotFoundError(f"CSV file not found: {data_input}")
-        
+
         rows = []
         headers = default_headers
         with open(data_input, "r", newline="") as f:
@@ -45,14 +45,21 @@ def load_data(data_input):
             first_row = next(reader, None)
             if first_row is None:
                 raise ValueError("CSV file is empty.")
-            
-            # Check if first row is a header
+
+            # ── NEW: skip the metadata comment line written by data_manager ──
+            if first_row and first_row[0].startswith("#"):
+                first_row = next(reader, None)
+                if first_row is None:
+                    raise ValueError("CSV file has only a comment line.")
+            # ─────────────────────────────────────────────────────────────────
+
+            # Check if this row is a header or data
             try:
                 float(first_row[0])
                 rows.append([float(val) for val in first_row])
             except ValueError:
                 headers = first_row
-                
+
             for row in reader:
                 if row:
                     rows.append([float(val) for val in row])

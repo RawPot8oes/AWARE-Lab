@@ -25,7 +25,7 @@ mpl.rcParams.update({"font.family": "DejaVu Sans", "font.size": 26, "axes.labels
     "grid.color": "#dddddd", "grid.linewidth": 1.0, "savefig.bbox": "tight", "savefig.pad_inches": 0.4})
 
 def load_and_average(filepath):
-    d = pd.read_csv(filepath)
+    d = pd.read_csv(filepath, comment='#')
     t = d.t.values - d.t.values[0]
     T = 1.0 / FREQ
     n_cyc = int(np.floor(t[-1] / T))
