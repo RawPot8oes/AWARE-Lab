@@ -22,6 +22,7 @@ from trajectory import generate_oscillatory_trajectory
 from ft_sensor import FTSensor
 from plotter import plot_results
 from data_manager import create_run
+from phase_average import generate_phase_avg
 
 # ======================================================================
 # CONFIG
@@ -312,10 +313,23 @@ def main():
         run.save_csv_with_fallback("log.csv",  log_rows,  LOG_HEADER)
         if meas_rows:
             run.save_csv_with_fallback("meas.csv", meas_rows, MEAS_HEADER)
+
+        # --- Overview plot (plotter.py) ---
         try:
             plot_results(log_rows, save_path=run.path("plot.png"), show=False)
         except Exception as e:
-            print(f"[run] Could not save plot: {e!r}")
+            print(f"[run] Could not save overview plot: {e!r}")
+
+        # --- Phase-averaged plot (phase_average.py) ---
+        try:
+            generate_phase_avg(
+                filepath=str(run.path("log.csv")),
+                out_dir=str(run.dir),
+                freq_hz=REF_FREQ_HZ,
+            ) 
+        except Exception as e:
+            print(f"[run] Could not save phase-averaged plot: {e!r}")
+
     else:
         print("[run] No data logged — nothing to save.")
 
